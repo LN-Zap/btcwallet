@@ -2359,6 +2359,149 @@ func (w *Wallet) GetTransactions(startBlock, endBlock *BlockIdentifier,
 	return &res, err
 }
 
+// GetTransaction returns data if any transaction given its id. A mined
+// transaction is returned in a Block structure which records properties about
+// the block. A bool is also returned to denote if the transaction did exist
+// in the database or not.
+func (w *Wallet) GetTransaction(txHash *chainhash.Hash) (*GetTransactionsResult,
+	bool, error) {
+
+	var res GetTransactionsResult
+	chainClient := w.chainClient
+	if chainClient == nil {
+		return nil, false, errors.New("no chain server client")
+	}
+
+	// Get the transaction information from directly calling the backend
+	// endpoint.
+	var txResult *btcjson.TxRawResult
+	var err error
+	switch client := chainClient.(type) {
+	case *chain.RPCClient:
+		txResult, err = client.GetRawTransactionVerbose(txHash)
+		if err != nil {
+			return nil, false, err
+		}
+	case *chain.BitcoindClient:
+		txResult, err = client.GetRawTransactionVerbose(txHash)
+		if err != nil {
+			return nil, false, err
+		}
+	case *chain.NeutrinoClient:
+		return nil, false, errors.New("not supported with neutrino client")
+	}
+
+	// Set the block hash from the provided string and get the block height
+	// from it.
+	var blockHash *chainhash.Hash
+	var blockHeight int32 = -1
+	if txResult.BlockHash != "" {
+		blockHashBytes, err := hex.DecodeString(txResult.BlockHash)
+		if err != nil {
+			return nil, false, err
+		}
+
+		// The byte is reversed due to different endianness in response
+		// and call.
+		reversed := make([]byte, len(blockHashBytes))
+		for i, n := range blockHashBytes {
+			j := len(blockHashBytes) - i - 1
+			reversed[j] = n
+		}
+		blockHash, err = chainhash.NewHash(reversed)
+		if err != nil {
+			return nil, false, err
+		}
+
+		// Obtain the block height from the backend.
+		switch client := chainClient.(type) {
+		case *chain.RPCClient:
+			header, err := client.GetBlockHeaderVerbose(blockHash)
+			if err != nil {
+				return nil, false, err
+			}
+			blockHeight = header.Height
+		case *chain.BitcoindClient:
+			var err error
+			blockHeight, err = client.GetBlockHeight(blockHash)
+			if err != nil {
+				return nil, false, err
+			}
+		case *chain.NeutrinoClient:
+			var err error
+			blockHeight, err = client.GetBlockHeight(blockHash)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+	}
+
+	// Populate with additional data if this transaction exists in the
+	// database.
+	var summary *TransactionSummary
+	var inDB bool
+	err = walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
+		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+
+		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
+			// TODO: probably should make RangeTransactions not
+			// reuse the details backing array memory.
+			dets := make([]wtxmgr.TxDetails, len(details))
+			copy(dets, details)
+			details = dets
+
+			for i := range details {
+				// TODO(BM): Can we read out the txID directly from the raw TxDetails?
+				dbTx := makeTxSummary(dbtx, w, &details[i])
+
+				// We are only interested in the specific
+				// transaction and can return early.
+				if txHash.IsEqual(dbTx.Hash) {
+					summary = &dbTx
+					inDB = true
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+
+		return w.TxStore.RangeTransactions(txmgrNs, blockHeight,
+			blockHeight, rangeFn)
+	})
+
+	// We need to build the transaction to return in the response if it was
+	// not found in the database.
+	if summary == nil {
+		txRaw, err := hex.DecodeString(txResult.Hex)
+		if err != nil {
+			return nil, false, err
+		}
+		summary = &TransactionSummary{
+			Hash:        txHash,
+			Transaction: txRaw,
+			MyInputs:    make([]TransactionSummaryInput, 0),
+			MyOutputs:   make([]TransactionSummaryOutput, 0),
+			Timestamp:   txResult.Time,
+		}
+	}
+
+	// Add the transaction either as confirmed or unconfirmed to the
+	// response.
+	switch blockHeight {
+	case -1:
+		res.UnminedTransactions = []TransactionSummary{*summary}
+	default:
+		res.MinedTransactions = []Block{{
+			Hash:         blockHash,
+			Height:       blockHeight,
+			Timestamp:    summary.Timestamp,
+			Transactions: []TransactionSummary{*summary},
+		}}
+	}
+
+	return &res, inDB, nil
+}
+
 // AccountResult is a single account result for the AccountsResult type.
 type AccountResult struct {
 	waddrmgr.AccountProperties
